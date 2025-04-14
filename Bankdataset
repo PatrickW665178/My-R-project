@@ -14,7 +14,7 @@ library(reshape2)
 # ----------------------------------------------------
 data <- read.csv("bank.csv", stringsAsFactors = FALSE)
 data <- data[, !(names(data) %in% c("job", "month", "day"))]
-# 將文字型欄位轉為 factor（若尚未轉換），尤其目標變數 y 要設為 factor，
+# 將文字型欄位轉為 factor，尤其目標變數 y 要設為 factor，
 #     並設定 y 的層級為 ("no", "yes")（方便後續判斷 positive 為 "yes"）
 for(col in names(data)){
   if(class(data[[col]]) == "character"){
