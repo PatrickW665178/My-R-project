@@ -1,0 +1,208 @@
+# ----------------------------------------------------
+# 1. 載入必要套件
+# ----------------------------------------------------
+library(caret)         
+library(randomForest)  
+library(gbm)           
+library(adabag)        
+library(pROC)          
+library(ggplot2)       
+library(reshape2)      
+
+# ----------------------------------------------------
+# 2. 讀取資料與前處理
+# ----------------------------------------------------
+data <- read.csv("bank.csv", stringsAsFactors = FALSE)
+data <- data[, !(names(data) %in% c("job", "month", "day"))]
+# 將文字型欄位轉為 factor（若尚未轉換），尤其目標變數 y 要設為 factor，
+#     並設定 y 的層級為 ("no", "yes")（方便後續判斷 positive 為 "yes"）
+for(col in names(data)){
+  if(class(data[[col]]) == "character"){
+    data[[col]] <- as.factor(data[[col]])
+  }
+}
+data$y <- factor(data$y, levels = c("no", "yes"))
+
+# ----------------------------------------------------
+# 3. 資料分割：70% 訓練集 / 30% 測試集
+# ----------------------------------------------------
+set.seed(123)
+trainIndex <- createDataPartition(data$y, p = 0.7, list = FALSE)
+trainData <- data[trainIndex, ]
+testData  <- data[-trainIndex, ]
+
+# 為了使用 gbm 模型，我們建立另一份訓練/測試資料 (trainData_gbm / testData_gbm)，
+# 將目標變數轉換為數值（y_num），並移除原始 y 欄
+trainData_gbm <- trainData
+trainData_gbm$y_num <- ifelse(trainData_gbm$y == "yes", 1, 0)
+trainData_gbm <- trainData_gbm[, !(names(trainData_gbm) %in% c("y"))]
+
+testData_gbm <- testData
+testData_gbm$y_num <- ifelse(testData_gbm$y == "yes", 1, 0)
+testData_gbm <- testData_gbm[, !(names(testData_gbm) %in% c("y"))]
+
+# ----------------------------------------------------
+# 4. (a) 模型建構與特徵重要性抽取
+# ----------------------------------------------------
+
+### 4.1 隨機森林模型
+set.seed(123)
+rf_model <- randomForest(y ~ ., data = trainData, importance = TRUE)
+# 取得 importance（使用 MeanDecreaseGini）
+rf_imp <- importance(rf_model)
+rf_imp_df <- data.frame(Feature = rownames(rf_imp),
+                        Importance = rf_imp[,"MeanDecreaseGini"])
+# 正規化：各特徵重要性除以全部總和
+rf_imp_df$Importance_norm <- rf_imp_df$Importance / sum(rf_imp_df$Importance)
+
+### 4.2 梯度提升模型 (gbm)
+set.seed(123)
+gbm_model <- gbm(y_num ~ ., 
+                 data = trainData_gbm, 
+                 distribution = "bernoulli",
+                 n.trees = 100,
+                 interaction.depth = 3,
+                 shrinkage = 0.1,
+                 n.minobsinnode = 10,
+                 verbose = FALSE)
+# 從 gbm 模型取得各變數的重要性 
+# summary() 回傳資料框架，欄位 var 與 rel.inf（相對重要性）
+gbm_imp <- summary(gbm_model, plotit = FALSE)
+gbm_imp_df <- data.frame(Feature = gbm_imp$var,
+                         Importance = gbm_imp$rel.inf)
+gbm_imp_df$Importance_norm <- gbm_imp_df$Importance / sum(gbm_imp_df$Importance)
+
+### 4.3 Adaboost 模型
+set.seed(123)
+adaboost_model <- boosting(y ~ ., data = trainData, boos = TRUE, mfinal = 100)
+adaboost_imp_df <- data.frame(Feature = names(adaboost_model$importance),
+                              Importance = adaboost_model$importance)
+adaboost_imp_df$Importance_norm <- adaboost_imp_df$Importance / sum(adaboost_imp_df$Importance)
+
+### 4.4 合併三模型的重要性
+# 先以隨機森林與 adaboost 合併，再與 gbm 合併；若某模型無此特徵，補 0
+imp_all <- merge(rf_imp_df[, c("Feature", "Importance_norm")],
+                 adaboost_imp_df[, c("Feature", "Importance_norm")],
+                 by = "Feature", all = TRUE, suffixes = c("_RF", "_Ada"))
+imp_all <- merge(imp_all, gbm_imp_df[, c("Feature", "Importance_norm")],
+                 by = "Feature", all = TRUE)
+names(imp_all)[names(imp_all) == "Importance_norm"] <- "Importance_norm_GBM"
+imp_all[is.na(imp_all)] <- 0
+# 取三模型正規化重要性均值
+imp_all$AvgImportance <- rowMeans(imp_all[, c("Importance_norm_RF",
+                                              "Importance_norm_Ada",
+                                              "Importance_norm_GBM")])
+# 依平均重要性排序
+imp_all <- imp_all[order(-imp_all$AvgImportance), ]
+print(imp_all)
+
+# 繪製平均特徵重要性長條圖
+ggplot(imp_all, aes(x = reorder(Feature, AvgImportance), y = AvgImportance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "三模型平均特徵重要性", x = "特徵", y = "平均歸一化重要性") +
+  theme_minimal()
+
+# ----------------------------------------------------
+# 5. (b) 新樣本預測
+# ----------------------------------------------------
+# 自訂一個求眾數的函數
+mode_function <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# 產生新樣本：依據訓練集（去除目標變數 y），
+# 離散變數：以眾數取代；數值變數：以中位數取代。
+predictor_vars <- setdiff(names(trainData), "y")  # 隨機森林與 adaboost用
+new_sample_list <- lapply(trainData[, predictor_vars], function(col) {
+  if(is.factor(col)) {
+    # 保持因子屬性與層級
+    factor(mode_function(col), levels = levels(col))
+  } else if(is.numeric(col)) {
+    median(col, na.rm = TRUE)
+  } else {
+    NA
+  }
+})
+new_sample <- as.data.frame(new_sample_list)
+print(new_sample)
+
+# 利用各模型預測新樣本
+
+## 隨機森林預測
+rf_pred_new <- predict(rf_model, new_sample)
+cat("隨機森林預測新樣本結果: ", as.character(rf_pred_new), "\n")
+
+## Adaboost預測
+adaboost_pred_new <- predict.boosting(adaboost_model, newdata = new_sample)
+cat("Adaboost 預測新樣本結果: ", as.character(adaboost_pred_new$class), "\n")
+
+## 對於 gbm 模型，由於訓練時使用 trainData_gbm（不含 y），
+## 故對新樣本亦需去除 y（保持 predictors 與 gbm 訓練資料相同）
+# 以 new_sample 為基礎（與 trainData predictors 相同）
+# gbm 模型預測
+gbm_pred_prob_new <- predict(gbm_model, newdata = new_sample, n.trees = 100, type = "response")
+gbm_pred_new <- ifelse(gbm_pred_prob_new > 0.5, "yes", "no")
+cat("gbm(梯度提升) 預測新樣本結果: ", gbm_pred_new, "\n")
+
+# ----------------------------------------------------
+# 6. (c) 模型效能評估與 ROC 曲線比較（測試集）
+# ----------------------------------------------------
+
+## 6.1 隨機森林在測試集上預測
+rf_pred_prob <- predict(rf_model, newdata = testData, type = "prob")[, "yes"]
+rf_pred_class <- predict(rf_model, newdata = testData)
+
+## 6.2 Adaboost 在測試集上預測
+adaboost_pred <- predict.boosting(adaboost_model, newdata = testData)
+# 若沒有 dimnames，可直接使用欄位索引 (假設第2欄為 "yes")
+adaboost_pred_prob <- adaboost_pred$prob[, 2]
+adaboost_pred_class <- adaboost_pred$class
+
+## 6.3 gbm 在測試集上預測
+gbm_pred_prob <- predict(gbm_model, newdata = testData_gbm, n.trees = 100, type = "response")
+gbm_pred_class <- ifelse(gbm_pred_prob > 0.5, "yes", "no")
+
+## 繪製 ROC 曲線
+roc_rf <- roc(as.numeric(testData$y == "yes"), rf_pred_prob)
+roc_adaboost <- roc(as.numeric(testData$y == "yes"), adaboost_pred_prob)
+roc_gbm <- roc(as.numeric(testData$y == "yes"), gbm_pred_prob)
+
+plot(roc_rf, col = "blue", lwd = 2, main = "ROC 曲線比較")
+lines(roc_adaboost, col = "red", lwd = 2)
+lines(roc_gbm, col = "green", lwd = 2)
+legend("bottomright",
+       legend = c(paste("RF (AUC =", round(auc(roc_rf), 3), ")"),
+                  paste("Adaboost (AUC =", round(auc(roc_adaboost), 3), ")"),
+                  paste("GBM (AUC =", round(auc(roc_gbm), 3), ")")),
+       col = c("blue", "red", "green"), lwd = 2)
+
+## 6.4 計算準確率、精確率、召回率與 F-measure
+calculate_metrics <- function(true, pred_class) {
+  cm <- confusionMatrix(factor(pred_class, levels = c("yes", "no")), true)
+  accuracy <- cm$overall["Accuracy"]
+  precision <- cm$byClass["Precision"]
+  recall <- cm$byClass["Recall"]
+  f_measure <- 2 * precision * recall / (precision + recall)
+  return(c(Accuracy = accuracy, Precision = precision, Recall = recall, F_measure = f_measure))
+}
+
+metrics_rf <- calculate_metrics(testData$y, rf_pred_class)
+metrics_adaboost <- calculate_metrics(testData$y, adaboost_pred_class)
+metrics_gbm <- calculate_metrics(testData$y, gbm_pred_class)
+
+# 合併為一個表格
+metrics_df <- rbind(RF = metrics_rf,
+                    Adaboost = metrics_adaboost,
+                    GBM = metrics_gbm)
+print(metrics_df)
+
+# 繪製性能指標條形圖（轉換成 long 格式）
+metrics_long <- melt(metrics_df)
+colnames(metrics_long) <- c("Model", "Metric", "Value")
+ggplot(metrics_long, aes(x = Metric, y = Value, fill = Model)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "各模型性能比較", x = "指標", y = "值") +
+  theme_minimal()
+
