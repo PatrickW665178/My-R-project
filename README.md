@@ -72,4 +72,4 @@ Adaboost 預測結果： no
 
 5. 模型效能評估 
 
- 
+ ![ROC](三模型ROC曲線.jpeg)
